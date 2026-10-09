@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------
+# Secrets and environment
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# Virtual environments / Python caches
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+
+# ---------------------------------------------------------------------------
+# Containers (the assignment forbids committing a Dockerfile)
+# ---------------------------------------------------------------------------
+Dockerfile
+docker-compose*.yml
+
+# ---------------------------------------------------------------------------
+# Candidate-kit material that must NOT be submitted
+# (the public repo ships only our own code + docs)
+# ---------------------------------------------------------------------------
+PROBLEM_STATEMENT.docx
+openapi.yaml
+DATA_MODEL.md
+sample_data/
+sample_seed.py
+SDT_candidate_kit.zip
+app/__init__.py
+
+# My private study notes and the build brief — local only, never submitted
+NOTES.md
+BRIEF.md
+brief.md
+
+# ---------------------------------------------------------------------------
+# Data dumps / scratch
+# ---------------------------------------------------------------------------
+*.dump
+*.bson
+dump/
+*.log
