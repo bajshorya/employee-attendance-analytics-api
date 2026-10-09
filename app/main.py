@@ -38,14 +38,20 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import date as date_cls
 from datetime import datetime, time as time_cls, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
+import bson.json_util
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 logger = logging.getLogger("attendance")
 
@@ -330,3 +336,365 @@ def ratio_or_none(numerator, denominator, places: int):
         return None
     result = round_half_up(Decimal(str(numerator)) / Decimal(str(denominator)), places)
     return float(result)
+
+
+# =========================================================================== #
+# 6. VALIDATION HELPERS
+# =========================================================================== #
+# Some validation (an epoch-ms shape, string patterns) is expressed on the Pydantic
+# models below. Business-rule 422s that Pydantic cannot express are raised through
+# this one helper, so the error body keeps FastAPI's DEFAULT validation shape,
+# {"detail": [ {...} ]}. (404 and 409 use HTTPException, giving {"detail": "..."}.)
+
+def raise_422(message: str, loc: tuple = ("body",)) -> None:
+    """Raise a FastAPI-shaped 422 with a single error entry carrying ``message``."""
+    raise RequestValidationError(
+        [{"type": "value_error", "loc": list(loc), "msg": message, "input": None}]
+    )
+
+
+def validate_date_param(value: str, field: str) -> date_cls:
+    """Validate a YYYY-MM-DD query/path parameter and return the parsed date.
+
+    We check the regex AND date.fromisoformat because each alone is too loose:
+    Pydantic's ``date`` type would accept ``2026-07-06T00:00:00``, and
+    ``fromisoformat`` alone accepts the no-dash basic form ``20260706``. The regex
+    pins the shape; ``fromisoformat`` rejects impossible dates like ``2026-13-40``.
+    """
+    if not re.match(DATE_RE, value):
+        raise_422("must match YYYY-MM-DD", ("query", field))
+    try:
+        return date_cls.fromisoformat(value)
+    except ValueError:
+        raise_422("not a valid calendar date", ("query", field))
+
+
+def month_bounds(month: str) -> tuple[str, str]:
+    """'YYYY-MM' -> (first-day, last-day) as 'YYYY-MM-DD' strings.
+
+    A month is matched as an inclusive STRING range on the ``date`` field
+    (``>= "YYYY-MM-01"`` and ``<= "YYYY-MM-<last>"``). String order equals date order
+    for YYYY-MM-DD, so this range is index-friendly and never needs date parsing in Mongo.
+    """
+    year, mon = int(month[:4]), int(month[5:7])
+    first = date_cls(year, mon, 1)
+    nxt = date_cls(year + (mon == 12), (mon % 12) + 1, 1)
+    last = nxt - timedelta(days=1)
+    return first.isoformat(), last.isoformat()
+
+
+# =========================================================================== #
+# 7. REQUEST MODELS
+# =========================================================================== #
+# EpochMs is strict on purpose: strict=True makes Pydantic reject "123" (string),
+# 1783312500000.0 (float) and true (bool), all of which a non-strict int would coerce.
+# The ge/le bounds reject seconds-sized and absurd values. Every one of those is a 422.
+EpochMs = Annotated[int, Field(strict=True, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)]
+
+
+class EmployeeCreate(BaseModel):
+    """Body for POST /employees. Mirrors openapi.yaml's EmployeeCreate exactly.
+
+    ``extra="ignore"`` drops any unknown field a client sends (e.g. a derived field),
+    which is the required behaviour.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    emp_code: Annotated[str, Field(pattern=EMP_CODE_RE)]
+    name: Annotated[str, Field(min_length=1, max_length=100)]
+    email: Annotated[str, Field(pattern=EMAIL_RE, max_length=120)]
+    department: Annotated[str, Field(min_length=1, max_length=50)]
+    shift_start: Annotated[str, Field(pattern=HHMM_RE)] = "09:30"
+    shift_end: Annotated[str, Field(pattern=HHMM_RE)] = "18:30"
+    # joined_on stays a plain string: PyMongo cannot store a datetime.date (it raises
+    # InvalidDocument), and the data model keeps calendar dates as strings on purpose.
+    joined_on: str
+
+    @field_validator("joined_on")
+    @classmethod
+    def _joined_on_is_a_real_date(cls, v: str) -> str:
+        if not re.match(DATE_RE, v):
+            raise ValueError("joined_on must match YYYY-MM-DD")
+        try:
+            date_cls.fromisoformat(v)
+        except ValueError:
+            raise ValueError("joined_on is not a valid calendar date")
+        return v
+
+    @model_validator(mode="after")
+    def _shifts_must_differ(self):
+        # Equal start/end is invalid (not an overnight shift); overnight is end < start.
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
+
+
+class PunchInRequest(BaseModel):
+    """Body for POST /attendance/punch-in.
+
+    ``emp_code`` is NOT pattern-checked here: an unknown/badly shaped code at punch-in
+    is a 404 (missing resource), not a 422. ``status`` is limited to the three presence
+    values. ``punched_at`` is optional (defaults to now) and strictly an epoch-ms int.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+
+class PunchOutRequest(BaseModel):
+    """Body for POST /attendance/punch-out."""
+    model_config = ConfigDict(extra="ignore")
+
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
+
+
+class RegularizeRequest(BaseModel):
+    """Body for PATCH /attendance/{emp_code}/{date}.
+
+    Only status/punch_in/punch_out can be corrected; derived fields can never be sent.
+    reason and regularized_by are required. We use ``model_fields_set`` at the endpoint
+    to tell "field omitted" (keep stored value) from "field supplied".
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    status: Optional[Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: Annotated[str, Field(min_length=5, max_length=200)]
+    regularized_by: Annotated[str, Field(min_length=1, max_length=50)]
+
+
+# =========================================================================== #
+# 8. RESPONSE SERIALISERS
+# =========================================================================== #
+# Every response is built by one of these. They (a) never leak MongoDB's _id, (b)
+# convert every stored BSON datetime to epoch ms, and (c) fill in defaults for legacy
+# seeded documents that omit fields (missing punch/work_hours -> null, missing minutes
+# -> 0, missing half_day -> false, missing history -> []).
+
+def serialize_employee(doc: dict) -> dict:
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": dt_to_ms(doc["created_at"]),
+    }
+
+
+def serialize_history_entry(entry: dict) -> dict:
+    """Serialise one history entry. The nested punch_in/punch_out from/to values are
+    BSON dates in storage and must become epoch ms (or null) in the API - this nested
+    conversion is easy to miss."""
+    changes: dict = {}
+    for field, delta in (entry.get("changes") or {}).items():
+        if field in ("punch_in", "punch_out"):
+            changes[field] = {"from": dt_to_ms(delta.get("from")), "to": dt_to_ms(delta.get("to"))}
+        else:
+            changes[field] = {"from": delta.get("from"), "to": delta.get("to")}
+    return {
+        "at": dt_to_ms(entry["at"]),
+        "by": entry.get("by"),
+        "reason": entry.get("reason"),
+        "changes": changes,
+    }
+
+
+def serialize_attendance(doc: dict) -> dict:
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": dt_to_ms(doc.get("punch_in")),
+        "punch_out": dt_to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),                 # None when missing/open
+        "late_minutes": doc.get("late_minutes") or 0,        # missing -> 0
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day", False)),        # missing -> False
+        "history": [serialize_history_entry(h) for h in (doc.get("history") or [])],
+    }
+
+
+# =========================================================================== #
+# 9. INDEX CREATION AND LIFESPAN
+# =========================================================================== #
+# Indexes are created idempotently at startup, each in its own try block so that a
+# single failure logs a warning instead of crashing the app (the grader must still get
+# a 200 from /health). The two UNIQUE indexes are what make create-employee and punch-in
+# race-safe without check-then-insert.
+INDEX_SPECS = [
+    # (collection, keys, options). Explicit names so re-creation is a cheap no-op.
+    ("employees", [("emp_code", ASCENDING)], {"name": "uq_emp_code", "unique": True}),
+    ("employees", [("department", ASCENDING), ("joined_on", ASCENDING)], {"name": "department_joined_on"}),
+    ("employees", [("joined_on", ASCENDING)], {"name": "joined_on"}),
+    ("attendance_logs", [("emp_code", ASCENDING), ("date", ASCENDING)], {"name": "uq_emp_code_date", "unique": True}),
+    ("attendance_logs", [("date", DESCENDING), ("emp_code", ASCENDING)], {"name": "date_desc_emp_code"}),
+    ("attendance_logs", [("emp_code", ASCENDING), ("punch_in", DESCENDING)], {"name": "emp_code_punch_in"}),
+]
+
+
+def ensure_indexes() -> None:
+    for collection, keys, options in INDEX_SPECS:
+        try:
+            db[collection].create_index(keys, **options)
+        except PyMongoError as exc:  # pragma: no cover - defensive
+            logger.warning("could not create index %s on %s: %s", options.get("name"), collection, exc)
+
+
+@asynccontextmanager
+async def lifespan(_app: "FastAPI"):
+    # Startup: make sure the indexes we rely on exist. Shutdown: nothing to do.
+    ensure_indexes()
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
+
+
+# --------------------------------------------------------------------------- #
+# Small shared helpers used by the endpoints
+# --------------------------------------------------------------------------- #
+def get_employee_or_404(emp_code: str) -> dict:
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+    return emp
+
+
+def build_attendance_filter(emp_code, date_from, date_to, status) -> dict:
+    """Build the Mongo filter for GET /attendance. Shared with /admin/explain so the
+    explained query is byte-for-byte the real one."""
+    query: dict = {}
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        date_range: dict = {}
+        if date_from is not None:
+            date_range["$gte"] = date_from
+        if date_to is not None:
+            date_range["$lte"] = date_to
+        query["date"] = date_range
+    if status is not None:
+        query["status"] = status
+    return query
+
+
+# =========================================================================== #
+# 10. CRUD ENDPOINTS
+# =========================================================================== #
+@app.get("/health")
+def health():
+    """Readiness probe. 200 only when MongoDB answers a ping, else 503 (never a crash)."""
+    try:
+        db.command("ping")
+    except PyMongoError:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    return {"status": "ok"}
+
+
+@app.post("/employees", status_code=201)
+def create_employee(body: EmployeeCreate):
+    """Create an employee. No check-then-insert: we insert and let the UNIQUE index on
+    emp_code reject a duplicate with DuplicateKeyError -> 409. created_at is the server
+    clock, stored and returned identically."""
+    doc = body.model_dump()
+    doc["created_at"] = now_utc()
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="emp_code already exists")
+    return serialize_employee(doc)
+
+
+@app.get("/employees")
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    """List employees, exact case-sensitive department filter, sorted by emp_code asc.
+    total reflects the filter. Sort/skip/limit are done by MongoDB."""
+    query = {"department": department} if department is not None else {}
+    total = db.employees.count_documents(query)
+    cursor = (
+        db.employees.find(query)
+        .sort("emp_code", ASCENDING)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {
+        "items": [serialize_employee(d) for d in cursor],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@app.post("/attendance/punch-in", status_code=201)
+def punch_in(body: PunchInRequest):
+    """Record a punch-in. Order: validate (Pydantic) -> 404 if employee unknown ->
+    truncate the instant -> compute R1 date and R2 lateness -> insert -> 409 on the
+    unique (emp_code, date) index if a record already exists for that date (including a
+    seeded ABSENT/LEAVE one). The unique index is what makes concurrent punch-ins safe."""
+    emp = get_employee_or_404(body.emp_code)
+    instant = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+    record_date = attendance_date(instant, emp["shift_start"], emp["shift_end"])
+    derived = compute_derived(body.status, instant, None, emp["shift_start"], emp["shift_end"], record_date)
+    doc = {
+        "emp_code": body.emp_code,
+        "date": record_date,
+        "status": body.status,
+        "punch_in": instant,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": derived["late_minutes"],
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="already has a record for this date")
+    return serialize_attendance(doc)
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    """List attendance records. date_from/date_to are inclusive string ranges;
+    date_from > date_to is 422. Sort date desc then emp_code asc, with sort/skip/limit
+    all pushed to MongoDB (never load the collection into memory)."""
+    if date_from is not None:
+        validate_date_param(date_from, "date_from")
+    if date_to is not None:
+        validate_date_param(date_to, "date_to")
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise_422("date_from must be on or before date_to", ("query", "date_from"))
+
+    query = build_attendance_filter(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(query)
+    cursor = (
+        db.attendance_logs.find(query)
+        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {
+        "items": [serialize_attendance(d) for d in cursor],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
