@@ -84,7 +84,7 @@ def build_dataset(db, *, scale="small", seed=12345):
     db.attendance_logs.delete_many({})
 
     if scale == "large":
-        n_bulk_emp, n_days = 240, 420       # ~100k logs
+        n_bulk_emp, n_days = 300, 480       # ~100k+ logs
     else:
         n_bulk_emp, n_days = 24, 150        # a few thousand logs (fast differential tests)
 

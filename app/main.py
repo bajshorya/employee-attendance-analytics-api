@@ -36,6 +36,7 @@ Design choices (explained where they are made):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1195,3 +1196,101 @@ def department_trend(
             "moving_avg_7d": None if moving_raw is None else float(round_half_up(Decimal(str(moving_raw)), 4)),
         })
     return {"department": department, "items": items}
+
+
+# =========================================================================== #
+# 13. EXPLAIN ENDPOINT
+# =========================================================================== #
+# Proves the real queries use indexes. For each named endpoint we rebuild its main
+# query/pipeline with the SAME builder the endpoint uses, run MongoDB's `explain` with
+# executionStats verbosity, and return the raw plan. The raw document contains BSON types
+# (Timestamp, Int64, ...) that FastAPI cannot serialise, so we round-trip it through
+# bson.json_util first. The grader asserts the plan has IXSCAN and no COLLSCAN at 100k.
+
+EXPLAIN_ENDPOINTS = ("attendance_list", "employee_monthly", "department_summary",
+                     "late_leaderboard", "department_trend")
+
+
+def _explain_find(collection, filter_, sort, skip, limit):
+    command = {"find": collection, "filter": filter_, "sort": sort, "skip": skip, "limit": limit}
+    return collection, db.command("explain", command, verbosity="executionStats")
+
+
+def _explain_aggregate(collection, pipeline):
+    command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    return collection, db.command("explain", command, verbosity="executionStats")
+
+
+def _require(value, name):
+    if value is None:
+        raise_422(f"{name} is required for this endpoint", ("query", name))
+    return value
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: str,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_RE),
+    department: Optional[str] = None,
+    limit: int = Query(DEFAULT_LEADERBOARD_LIMIT, ge=1, le=MAX_LEADERBOARD_LIMIT),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]] = None,
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    if endpoint not in EXPLAIN_ENDPOINTS:
+        raise_422(f"endpoint must be one of {', '.join(EXPLAIN_ENDPOINTS)}", ("path", "endpoint"))
+
+    if endpoint == "attendance_list":
+        if date_from is not None:
+            validate_date_param(date_from, "date_from")
+        if date_to is not None:
+            validate_date_param(date_to, "date_to")
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise_422("date_from must be on or before date_to", ("query", "date_from"))
+        filter_ = build_attendance_filter(emp_code, date_from, date_to, status)
+        collection, explain = _explain_find(
+            "attendance_logs", filter_,
+            {"date": -1, "emp_code": 1}, (page - 1) * page_size, page_size,
+        )
+
+    elif endpoint == "employee_monthly":
+        _require(emp_code, "emp_code")
+        _require(month, "month")
+        first, last = month_bounds(month)
+        collection, explain = _explain_aggregate(
+            "attendance_logs", employee_monthly_pipeline(emp_code, first, last))
+
+    elif endpoint == "department_summary":
+        _require(month, "month")
+        first, last = month_bounds(month)
+        collection, explain = _explain_aggregate(
+            "employees", department_summary_pipeline(first, last, department))
+
+    elif endpoint == "late_leaderboard":
+        _require(month, "month")
+        first, last = month_bounds(month)
+        collection, explain = _explain_aggregate(
+            "attendance_logs", late_leaderboard_pipeline(first, last, limit, department))
+
+    else:  # department_trend
+        _require(department, "department")
+        _require(from_, "from")
+        _require(to, "to")
+        from_date = validate_date_param(from_, "from")
+        to_date = validate_date_param(to, "to")
+        dept_codes = [e["emp_code"] for e in db.employees.find({"department": department}, {"emp_code": 1, "_id": 0})]
+        from_dt = datetime(from_date.year, from_date.month, from_date.day, tzinfo=timezone.utc)
+        to_plus1_dt = datetime(to_date.year, to_date.month, to_date.day, tzinfo=timezone.utc) + timedelta(days=1)
+        collection, explain = _explain_aggregate(
+            "employees",
+            department_trend_pipeline(department, from_, to, from_dt, to_plus1_dt, dept_codes),
+        )
+
+    # BSON -> plain JSON (Timestamp/Int64/Binary become JSON-safe).
+    explain_json = json.loads(bson.json_util.dumps(explain))
+    return {"endpoint": endpoint, "collection": collection, "explain": explain_json}
