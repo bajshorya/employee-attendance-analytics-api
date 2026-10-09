@@ -1,0 +1,4 @@
+# Test-only dependencies. These are NOT needed to run the service, so they are kept
+# out of requirements.txt (which must list only what app/main.py imports).
+pytest>=8.0
+httpx>=0.27
