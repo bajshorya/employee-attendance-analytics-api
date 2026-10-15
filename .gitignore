@@ -45,10 +45,9 @@ sample_seed.py
 SDT_candidate_kit.zip
 app/__init__.py
 
-# My private study notes and the build brief — local only, never submitted
-NOTES.md
-BRIEF.md
-brief.md
+# Local-only docs (study notes, testing guide, the build brief) — never submitted.
+# Anything under local/ is private to this machine.
+local/
 
 # ---------------------------------------------------------------------------
 # Data dumps / scratch
