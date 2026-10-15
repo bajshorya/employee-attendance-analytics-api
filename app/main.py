@@ -44,7 +44,7 @@ from contextlib import asynccontextmanager
 from datetime import date as date_cls
 from datetime import datetime, time as time_cls, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Literal, NoReturn, Optional
 
 import bson.json_util
 from bson.decimal128 import Decimal128
@@ -301,6 +301,7 @@ def compute_derived(
     if status in PRESENCE_STATUSES:
         # A presence status always has a punch_in by the time we get here (enforced by
         # the endpoints), so late minutes are always computable.
+        assert punch_in is not None
         late = compute_late_minutes(punch_in, date_str, shift_start)
         if punch_out is None:
             return {"work_hours": None, "late_minutes": late,
@@ -348,7 +349,7 @@ def ratio_or_none(numerator, denominator, places: int):
 # this one helper, so the error body keeps FastAPI's DEFAULT validation shape,
 # {"detail": [ {...} ]}. (404 and 409 use HTTPException, giving {"detail": "..."}.)
 
-def raise_422(message: str, loc: tuple = ("body",)) -> None:
+def raise_422(message: str, loc: tuple = ("body",)) -> NoReturn:
     """Raise a FastAPI-shaped 422 with a single error entry carrying ``message``."""
     raise RequestValidationError(
         [{"type": "value_error", "loc": list(loc), "msg": message, "input": None}]
@@ -781,7 +782,7 @@ def regularize(emp_code: str, date: str, body: RegularizeRequest):
     stored_pin = record.get("punch_in")
     stored_pout = record.get("punch_out")
 
-    final_status = body.status if "status" in supplied else stored_status
+    final_status = body.status if "status" in supplied and body.status is not None else stored_status
     sup_pin = "punch_in" in supplied
     sup_pout = "punch_out" in supplied
 
@@ -1221,7 +1222,7 @@ def _explain_aggregate(collection, pipeline):
     return collection, db.command("explain", command, verbosity="executionStats")
 
 
-def _require(value, name):
+def _require(value: Optional[str], name: str) -> str:
     if value is None:
         raise_422(f"{name} is required for this endpoint", ("query", name))
     return value
@@ -1259,28 +1260,28 @@ def explain_endpoint(
         )
 
     elif endpoint == "employee_monthly":
-        _require(emp_code, "emp_code")
-        _require(month, "month")
+        emp_code = _require(emp_code, "emp_code")
+        month = _require(month, "month")
         first, last = month_bounds(month)
         collection, explain = _explain_aggregate(
             "attendance_logs", employee_monthly_pipeline(emp_code, first, last))
 
     elif endpoint == "department_summary":
-        _require(month, "month")
+        month = _require(month, "month")
         first, last = month_bounds(month)
         collection, explain = _explain_aggregate(
             "employees", department_summary_pipeline(first, last, department))
 
     elif endpoint == "late_leaderboard":
-        _require(month, "month")
+        month = _require(month, "month")
         first, last = month_bounds(month)
         collection, explain = _explain_aggregate(
             "attendance_logs", late_leaderboard_pipeline(first, last, limit, department))
 
     else:  # department_trend
-        _require(department, "department")
-        _require(from_, "from")
-        _require(to, "to")
+        department = _require(department, "department")
+        from_ = _require(from_, "from")
+        to = _require(to, "to")
         from_date = validate_date_param(from_, "from")
         to_date = validate_date_param(to, "to")
         dept_codes = [e["emp_code"] for e in db.employees.find({"department": department}, {"emp_code": 1, "_id": 0})]

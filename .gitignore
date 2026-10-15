@@ -24,6 +24,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+.zed/
+pyrightconfig.json
 
 # ---------------------------------------------------------------------------
 # Containers (the assignment forbids committing a Dockerfile)
